@@ -26,16 +26,18 @@ No LLM, no embeddings, no training, no database. Baseline first.
 
 ## Installation
 
-Requires Python 3.10+.
+Requires Python 3.10+. One command — first launch sets everything up:
 
 ```bash
-git clone <repo-url>
 cd subtitle_vocab_mvp
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python -m spacy download en_core_web_sm
+./run.sh [movie.srt]
 ```
+
+`run.sh` creates `.venv/`, installs `requirements.txt`, fetches the spaCy
+model on first launch, then starts the TUI. (Prefer manual control?
+`./setup.sh` does the environment part alone.) An optional `.env` file
+containing `GROQ_API_KEY=...` is picked up automatically — never committed
+(it's gitignored).
 
 ## Usage
 

@@ -3,3 +3,5 @@ __pycache__/
 outputs/
 *.apkg
 *_definitions.json
+.venv/
+.env
