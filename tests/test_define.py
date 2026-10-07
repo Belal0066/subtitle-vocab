@@ -3,9 +3,13 @@ import json
 
 import define
 from define import (
+    RateLimiter,
     build_cache_key,
     define_all,
+    estimate_tokens,
+    fetch_definition,
     load_cache,
+    parse_retry_after,
     row_contexts,
     rows_to_candidates,
     save_cache,
@@ -101,7 +105,8 @@ def test_define_all_fetches_on_miss_and_caches(monkeypatch):
     rows = [_row()]
     calls = []
 
-    def _fake_fetch(base_url, api_key, model, lemma, level, contexts):
+    def _fake_fetch(base_url, api_key, model, lemma, level, contexts,
+                      **kw):
         calls.append((lemma, level))
         return _good_def(definition="loss of respect.",
                          example="They faced dishonor.")
@@ -250,8 +255,170 @@ def test_post_chat_sends_browser_user_agent(monkeypatch):
         return _FakeResp()
 
     monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
-    out = define._post_chat("https://x.test/v1", "KEY", "m",
-                            [{"role": "user", "content": "hi"}])
+    out, usage = define._post_chat("https://x.test/v1", "KEY", "m",
+                                   [{"role": "user", "content": "hi"}])
     assert out == "hi"
+    assert usage == {}
     assert captured["url"] == "https://x.test/v1/chat/completions"
     assert captured["ua"] and "Python-urllib" not in captured["ua"]
+
+
+def test_post_chat_returns_usage():
+    import io
+    import json as _json
+    import urllib.request
+
+    class _FakeResp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self):
+            return _json.dumps(
+                {"choices": [{"message": {"content": "hi"}}],
+                 "usage": {"total_tokens": 123}}).encode()
+
+    monkeypatch_urlopen = _FakeResp()
+    import unittest.mock as _mock
+    with _mock.patch.object(urllib.request, "urlopen",
+                            return_value=monkeypatch_urlopen):
+        out, usage = define._post_chat("https://x/v1", None, "m", [])
+    assert usage == {"total_tokens": 123}
+
+
+# --- rate limiting -------------------------------------------------------------------
+
+class _Clock:
+    def __init__(self):
+        self.now = 1000.0
+        self.slept = []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, secs):
+        self.slept.append(secs)
+        self.now += secs
+
+
+def test_estimate_tokens_scales_with_length():
+    assert estimate_tokens("") >= 1
+    assert estimate_tokens("x" * 400) == 100
+    assert estimate_tokens("x" * 400, "y" * 400) == 200
+
+
+def test_rate_limiter_request_cap_blocks_31st_call():
+    clock = _Clock()
+    lim = RateLimiter(max_requests_per_min=30, max_tokens_per_min=10**9,
+                      clock=clock, sleep=clock.sleep)
+    for _ in range(30):
+        assert lim.reserve(10) == 0.0
+    waited = lim.reserve(10)
+    assert 59.0 < waited <= 60.0  # oldest call must age out of the window
+    assert clock.now >= 1060.0
+
+
+def test_rate_limiter_token_cap_blocks_over_budget():
+    clock = _Clock()
+    lim = RateLimiter(max_requests_per_min=10**9, max_tokens_per_min=8000,
+                      clock=clock, sleep=clock.sleep)
+    assert lim.reserve(7000) == 0.0
+    waited = lim.reserve(2000)  # 7000 + 2000 > 8000 -> must wait
+    assert waited > 0
+    assert lim.reserve(100) == 0.0  # old entry aged out while waiting
+
+
+def test_rate_limiter_correct_replaces_estimate():
+    clock = _Clock()
+    lim = RateLimiter(max_requests_per_min=10**9, max_tokens_per_min=1000,
+                      clock=clock, sleep=clock.sleep)
+    lim.reserve(900)
+    lim.correct(100)  # real usage was far smaller...
+    assert lim.reserve(900) == 0.0  # ...so this now fits
+
+
+def test_parse_retry_after():
+    import urllib.error
+    from email.message import Message
+
+    def _err(val):
+        headers = Message()
+        if val is not None:
+            headers["Retry-After"] = val
+        return urllib.error.HTTPError("http://x", 429, "slow", headers, None)
+
+    assert parse_retry_after(_err("7")) == 7.0
+    assert parse_retry_after(_err(None)) is None
+    assert parse_retry_after(_err("bogus")) is None
+    assert parse_retry_after(_err("9999")) is None  # capped
+    assert parse_retry_after(ValueError()) is None
+
+
+def test_fetch_definition_retries_429_then_succeeds(monkeypatch):
+    import urllib.error
+    from email.message import Message
+
+    headers = Message()
+    headers["Retry-After"] = "0"
+    err429 = urllib.error.HTTPError("http://x", 429, "slow", headers, None)
+    calls = []
+    slept = []
+    good = {"definition": "d", "sense": "s", "example": "e",
+            "synonyms": {"easier": "a", "harder": "b"}, "antonym": "c"}
+
+    def _fake_post(base_url, api_key, model, messages, timeout=60):
+        calls.append(1)
+        if len(calls) == 1:
+            raise err429
+        import json as _json
+        return _json.dumps(good), {"total_tokens": 50}
+
+    monkeypatch.setattr(define, "_post_chat", _fake_post)
+    monkeypatch.setattr(define.time, "sleep", slept.append)
+    out = fetch_definition("http://x", "K", "m", "w", "B2", ["ctx"])
+    assert out["definition"] == "d"
+    assert len(calls) == 2
+    assert slept  # backed off on the 429
+
+
+def test_fetch_definition_gives_up_after_retries(monkeypatch):
+    import urllib.error
+    from email.message import Message
+
+    err429 = urllib.error.HTTPError("http://x", 429, "slow", Message(), None)
+    monkeypatch.setattr(define, "_post_chat",
+                        lambda *a, **k: (_ for _ in ()).throw(err429))
+    monkeypatch.setattr(define.time, "sleep", lambda s: None)
+    try:
+        fetch_definition("http://x", "K", "m", "w", "B2", ["c"],
+                         max_retries=3)
+    except RuntimeError as exc:
+        assert "definition failed" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_define_all_uses_limiter_only_on_miss(monkeypatch):
+    import json as _json
+    rows = [_row("alpha"), _row("beta")]
+    key = build_cache_key("alpha", "B2", ["risk shame, dishonor, exile?"])
+    cache = {key: dict(_good_def(), definition="cached.")}
+
+    reserved, corrected = [], []
+
+    class _Lim:
+        def reserve(self, est):
+            reserved.append(est)
+            return 0.0
+
+        def correct(self, actual):
+            corrected.append(actual)
+
+    def _fake_post(base_url, api_key, model, messages, timeout=60):
+        return _json.dumps(_good_def()), {"total_tokens": 432}
+
+    monkeypatch.setattr(define, "_post_chat", _fake_post)
+    monkeypatch.setattr(define.time, "sleep", lambda s: None)
+    defs, _ = define_all(rows, "B2", None, cache, "http://x", "KEY",
+                         "m", "groq", verbose=False, rate_limiter=_Lim())
+    assert defs["alpha"]["definition"] == "cached."
+    assert len(reserved) == 1  # only the beta miss reserved budget
+    assert corrected == [432]  # real usage corrected the estimate

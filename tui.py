@@ -195,7 +195,8 @@ def run_definitions(csv_path: Path, srt: Path, cfg: dict,
 
         definitions, cache = define_mod.define_all(
             rows, cfg["level"], full_contexts, cache, base_url, api_key,
-            model, "groq", verbose=False, on_each=_tick)
+            model, "groq", verbose=False, on_each=_tick,
+            rate_limiter=define_mod.RateLimiter())
     define_mod.save_cache(cache_path, cache)
     # Rebuild deck + study sheet with definitions.
     import genanki

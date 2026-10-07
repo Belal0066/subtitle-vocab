@@ -182,6 +182,10 @@ python define.py movie_vocab.csv --level B2 --srt movie.srt
   the same word in another movie (possibly another sense) is never wrongly
   reused. `--max-definitions N` caps fresh calls; `--dry-run` previews
   cache hits vs calls.
+- Rate limits are enforced client-side as sliding 60-second windows:
+  `--rpm` (default 30) and `--tpm` (default 8000, estimated chars/4 and
+  corrected with the API's real usage). HTTP 429s honour `Retry-After`
+  with backoff instead of crashing the run.
 - Rebuilds the `.apkg` in the same order; cards gain definition + "used here
   as" sense + clean example + easier/harder synonyms + antonym. If generation
   fails (or the key is missing),

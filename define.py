@@ -28,6 +28,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -67,12 +68,110 @@ SYSTEM_PROMPT = (
 
 
 # ---------------------------------------------------------------------------
+# Rate limiting (Groq free tier: 30 req/min, 8k tokens/min -- both enforced
+# as sliding 60s windows so bursts at window edges can't overshoot)
+# ---------------------------------------------------------------------------
+
+#: Rough token estimate for English prose (~4 chars/token). Deliberately
+#: crude: it only needs to keep us under the per-minute budget, and the
+#: real usage reported by the API corrects the books after each call.
+CHARS_PER_TOKEN = 4
+
+#: Tokens reserved for the model's reply when estimating a call upfront.
+RESPONSE_TOKEN_RESERVE = 300
+
+
+def estimate_tokens(*texts: str) -> int:
+    """Conservative token estimate for one or more texts."""
+    return sum(max(1, len(t or "") // CHARS_PER_TOKEN) for t in texts)
+
+
+class RateLimiter:
+    """Sliding-window limiter for requests/min and tokens/min.
+
+    ``reserve()`` blocks until a call of *est_tokens* fits both budgets,
+    then books it. ``correct()`` replaces the estimate with the real
+    usage once known. Clock/sleep are injectable for tests.
+    """
+
+    WINDOW = 60.0
+
+    def __init__(self, max_requests_per_min: int = 30,
+                 max_tokens_per_min: int = 8000,
+                 clock=time.monotonic, sleep=time.sleep) -> None:
+        self.req_cap = max(1, max_requests_per_min)
+        self.tok_cap = max(1, max_tokens_per_min)
+        self._clock = clock
+        self._sleep = sleep
+        self._calls: list[tuple[float, int]] = []  # (timestamp, tokens)
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - self.WINDOW
+        self._calls = [(t, n) for t, n in self._calls if t > cutoff]
+
+    def _wait_for(self, est_tokens: int) -> float:
+        """Seconds until a call of *est_tokens* fits; 0 if it fits now."""
+        now = self._clock()
+        self._prune(now)
+        waits = [0.0]
+        if len(self._calls) >= self.req_cap:
+            waits.append(self._calls[0][0] + self.WINDOW - now)
+        used = sum(n for _, n in self._calls)
+        if used + est_tokens > self.tok_cap:
+            # Wait until enough old calls age out of the window.
+            running = used
+            for ts, n in self._calls:
+                running -= n
+                if running + est_tokens <= self.tok_cap:
+                    waits.append(ts + self.WINDOW - now)
+                    break
+        return max(0.0, max(waits))
+
+    def reserve(self, est_tokens: int) -> float:
+        """Block until the call fits, book it, return seconds waited."""
+        waited = 0.0
+        while True:
+            wait = self._wait_for(max(0, est_tokens))
+            if wait <= 0:
+                break
+            self._sleep(wait)
+            waited += wait
+        self._calls.append((self._clock(), est_tokens))
+        return waited
+
+    def correct(self, actual_tokens: int) -> None:
+        """Replace the last reservation with the real token usage."""
+        if self._calls:
+            ts, _ = self._calls[-1]
+            self._calls[-1] = (ts, max(0, actual_tokens))
+
+
+def parse_retry_after(exc) -> float | None:
+    """Seconds from an HTTP 429's Retry-After header, if usable."""
+    try:
+        headers = getattr(exc, "headers", None)
+        raw = headers.get("Retry-After") if headers else None
+        if raw is None:
+            return None
+        wait = float(str(raw).strip())
+        if 0 <= wait <= 300:
+            return wait
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
 # LLM client (minimal OpenAI-compatible chat over stdlib urllib)
 # ---------------------------------------------------------------------------
 
 def _post_chat(base_url: str, api_key: str | None, model: str,
-               messages: list[dict], timeout: int = 60) -> str:
-    """POST one chat-completions request; return the assistant's text."""
+               messages: list[dict], timeout: int = 60) -> tuple[str, dict]:
+    """POST one chat-completions request.
+
+    Returns ``(assistant_text, usage)`` where usage is the API's
+    ``usage`` object (may be empty). Raises on transport/HTTP errors.
+    """
     url = base_url.rstrip("/") + "/chat/completions"
     payload = json.dumps({
         "model": model,
@@ -93,9 +192,11 @@ def _post_chat(base_url: str, api_key: str | None, model: str,
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         body = json.loads(resp.read().decode("utf-8"))
     try:
-        return body["choices"][0]["message"]["content"]
+        content = body["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
         raise RuntimeError(f"unexpected chat response shape: {body!r}") from exc
+    usage = body.get("usage") if isinstance(body, dict) else None
+    return content, usage if isinstance(usage, dict) else {}
 
 
 def build_user_prompt(lemma: str, level: str, contexts: list[str]) -> str:
@@ -137,24 +238,52 @@ def validate_definition(data) -> dict | None:
 
 
 def fetch_definition(base_url: str, api_key: str | None, model: str,
-                     lemma: str, level: str, contexts: list[str]) -> dict:
-    """Ask the model for a definition; retry once on bad JSON. Raises."""
+                     lemma: str, level: str, contexts: list[str],
+                     rate_limiter: RateLimiter | None = None,
+                     max_retries: int = 5) -> dict:
+    """Ask the model for a definition; return the validated dict.
+
+    Paces the call through *rate_limiter* (booking estimated tokens,
+    correcting with real usage afterwards) and honours HTTP 429
+    Retry-After headers with backoff. Raises after *max_retries*.
+    """
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user",
          "content": build_user_prompt(lemma, level, contexts)},
     ]
+    est = estimate_tokens(SYSTEM_PROMPT, messages[1]["content"]) \
+        + RESPONSE_TOKEN_RESERVE
     last_error: Exception | None = None
-    for _ in range(2):
+    for attempt in range(max_retries):
         try:
-            raw = _post_chat(base_url, api_key, model, messages)
+            if rate_limiter is not None:
+                rate_limiter.reserve(est)
+            raw, usage = _post_chat(base_url, api_key, model, messages)
+            if rate_limiter is not None:
+                try:
+                    actual = int(usage.get("total_tokens", 0)) or None
+                except (ValueError, TypeError, AttributeError):
+                    actual = None
+                rate_limiter.correct(actual or est + 250)
             clean = validate_definition(json.loads(raw))
             if clean is not None:
                 return clean
             last_error = ValueError(f"invalid definition JSON: {raw[:200]!r}")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429 and attempt < max_retries - 1:
+                wait = parse_retry_after(exc) \
+                    or min(2 ** attempt * 5, 60)
+                time.sleep(wait)
+                last_error = exc
+                continue
+            last_error = exc
+            break
         except Exception as exc:  # network, JSON, shape -- retry once
             last_error = exc
-        time.sleep(1)
+            if attempt >= 1:
+                break
+            time.sleep(1)
     raise RuntimeError(f"definition failed for {lemma!r}: {last_error}")
 
 
@@ -257,7 +386,8 @@ def define_all(rows: list[dict], level: str,
                model: str, provider: str,
                max_definitions: int | None = None,
                verbose: bool = True,
-               on_each=None) -> tuple[dict[str, dict], dict]:
+               on_each=None,
+               rate_limiter: RateLimiter | None = None) -> tuple[dict[str, dict], dict]:
     """Fill the cache for every CSV row; return (definitions, cache).
 
     definitions maps lemma -> {definition, sense, example, ...}. Rows whose
@@ -290,7 +420,8 @@ def define_all(rows: list[dict], level: str,
                 continue
             try:
                 clean = fetch_definition(base_url, api_key, model,
-                                         lemma, level, contexts)
+                                         lemma, level, contexts,
+                                         rate_limiter=rate_limiter)
             except Exception as exc:
                 print(f"  ! {lemma}: {exc}", file=sys.stderr)
                 if on_each:
@@ -378,6 +509,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help=f"Model id (default: {DEFAULT_MODEL}).")
     p.add_argument("--api-base", type=str, default=None,
                    help="Override provider chat-completions base URL.")
+    p.add_argument("--rpm", type=int, default=30,
+                   help="Max API requests per minute (default: 30, "
+                        "Groq free tier).")
+    p.add_argument("--tpm", type=int, default=8000,
+                   help="Max tokens per minute, estimated chars/4 and "
+                        "corrected with real usage (default: 8000).")
     p.add_argument("--md", type=Path, default=None,
                    help="Also write a human-readable Markdown study sheet "
                         "(default: vocab.md next to the CSV). "
@@ -490,7 +627,8 @@ def main(argv=None) -> int:
     definitions, cache = define_all(
         rows, args.level, full_contexts, cache,
         base_url, api_key, args.model, args.provider,
-        max_definitions=args.max_definitions)
+        max_definitions=args.max_definitions,
+        rate_limiter=RateLimiter(args.rpm, args.tpm))
     save_cache(cache_path, cache)
 
     # Rebuild candidate/context structures rank-order preserved.
@@ -517,6 +655,7 @@ def main(argv=None) -> int:
                        deck_name, md_path)
 
     print(f"CSV:         {args.csv_file} ({len(rows)} rows)")
+    print(f"Pacing:      <={args.rpm} req/min, <={args.tpm} tok/min")
     print(f"Definitions: {len(definitions)}/{len(candidates)} cards")
     print(f"Cache:       {cache_path} ({len(cache)} entries)")
     print(f"Anki deck:   {output_path}")
