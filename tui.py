@@ -97,9 +97,9 @@ def pick_srt(cli_arg: str | None) -> Path:
 
 
 def ask_settings(srt: Path) -> dict:
-    level = Prompt.ask("Learner level (words ABOVE this are kept)",
+    level = Prompt.ask("Learner level (words AT/ABOVE this are kept)",
                        choices=list(sv.CEFR_ORDER), default="B2")
-    top = IntPrompt.ask("Max words", default=50)
+    top = IntPrompt.ask("Max words (0 = all)", default=0)
     min_count = IntPrompt.ask("Minimum occurrences", default=1)
     min_zipf = float(Prompt.ask("Zipf fallback for UNKNOWN words "
                                 "(0 disables)", default="4.5"))
@@ -185,7 +185,8 @@ def run_ranking(srt: Path, cfg: dict) -> dict:
     excluded = sv.parse_exclude(cfg["exclude"])
     while True:
         ranked = _build(excluded)
-        selected = ranked[: cfg["top"]]
+        cap = cfg["top"]
+        selected = ranked[:cap] if cap > 0 else ranked
         console.print(Panel(
             f"Subtitles {len(subtitles)} · lemmas {len(counts)} · "
             f"candidates {len(ranked)} · selected {len(selected)}"
@@ -200,7 +201,8 @@ def run_ranking(srt: Path, cfg: dict) -> dict:
         if set(excluded) == before:
             break
         ranked = _build(excluded)
-        selected = ranked[: cfg["top"]]
+        cap = cfg["top"]
+        selected = ranked[:cap] if cap > 0 else ranked
         show_top_table(selected)
 
     outdir = sv.default_outdir(srt) / sv.slugify_stem(srt.name)

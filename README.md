@@ -75,8 +75,8 @@ python subtitle_vocab.py examples/test.srt --level C1 --top 20
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--level A1…C2` | `C1` | "Show words likely **above** my level." Words with known CEFR at/below this are excluded. |
-| `--top` | `50` | Max cards / CSV rows kept. |
+| `--level A1…C2` | `C1` | "Show words at/above my level." `--level B2` keeps B2+C1+C2; `--level C1` keeps C1+C2. Combine with `--min-zipf 0` for exactly those bands (no UNKNOWN). |
+| `--top` | `50` | Max cards/rows; `0` = no limit, keep all candidates. |
 | `--output` (`-o`) | `outputs/<slug>/vocab.apkg` | Anki deck path. |
 | `--csv` | `outputs/<slug>/vocab.csv` | CSV path. |
 | `--outdir` | `outputs/` next to input | Base folder for per-input output folders. |

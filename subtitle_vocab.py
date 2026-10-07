@@ -476,15 +476,16 @@ def score_lemma(count: int, zipf: float,
 
 def is_eligible(cefr_level: str | None, zipf: float,
                 learner_order: int, min_zipf: float) -> bool:
-    """Learner-level gate.
+    """Learner-level gate (inclusive: "B2 and above" means B1 excluded).
 
-    - CEFR known: eligible iff ``CEFR(word) > learner level``.
+    - CEFR known: eligible iff ``CEFR(word) >= learner level``.
     - CEFR unknown: eligible iff ``zipf <= min_zipf`` (Zipf fallback;
       NOT a CEFR prediction -- labelled UNKNOWN in outputs).
-      ``min_zipf <= 0`` disables UNKNOWN words entirely.
+      ``min_zipf <= 0`` disables UNKNOWN words entirely, so combining
+      e.g. ``--level B2 --min-zipf 0`` selects exactly B2/C1/C2 words.
     """
     if cefr_level:
-        return CEFR_ORDER[cefr_level] > learner_order
+        return CEFR_ORDER[cefr_level] >= learner_order
     return min_zipf > 0 and zipf <= min_zipf
 
 
@@ -806,7 +807,8 @@ def parse_args(argv=None) -> argparse.Namespace:
             "BEFORE watching a specific movie/show.\n\n"
             "Baseline ranker (no ML): rarity (wordfreq Zipf) x "
             "recurrence (log1p count in this file).\n\n"
-            "--level means 'show words likely ABOVE this level'. "
+            "--level means 'show words AT OR ABOVE this level' "
+            "(B2 keeps B2+C1+C2, C1 keeps C1+C2). "
             "Words with a known CEFR at or below your level are excluded. "
             "CEFR may come from a simple TSV or from CEFR-J/Octanove "
             "profile CSVs (POS-aware). Words missing from all CEFR files "
@@ -818,9 +820,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("srt_file", type=Path, help="Input .srt subtitle file")
     p.add_argument("--level", choices=sorted(CEFR_ORDER, key=CEFR_ORDER.get),
                    default="C1",
-                   help="Learner level; keep words above this (default: C1).")
+                   help="Learner level; keep words AT OR ABOVE this "
+                        "(B2 keeps B2+C1+C2; C1 keeps C1+C2). Default: C1.")
     p.add_argument("--top", type=int, default=50,
-                   help="Max cards/rows to keep (default: 50).")
+                   help="Max cards/rows to keep; 0 = no limit, keep all "
+                        "candidates (default: 50).")
     p.add_argument("--output", type=Path, default=None,
                    help="Anki .apkg path "
                         "(default: <outdir>/<slug>/vocab.apkg).")
@@ -874,8 +878,8 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     if not args.srt_file.exists():
         raise SystemExit(f"Input not found: {args.srt_file}")
-    if args.top <= 0:
-        raise SystemExit("--top must be >= 1")
+    if args.top < 0:
+        raise SystemExit("--top must be >= 0 (0 = no limit)")
 
     output_path, csv_path = resolve_defaults(args)
     cefr = load_cefr_profiles(args.cefr)
@@ -896,7 +900,7 @@ def main(argv=None) -> int:
                                   cefr, args.level, args.min_zipf,
                                   args.min_count,
                                   pos_counts=pos_counts, exclude=excluded)
-    selected = ranked_all[:args.top]
+    selected = ranked_all[:args.top] if args.top > 0 else ranked_all
 
     write_csv(selected, csv_path)
     deck_name = output_path.stem.replace("_", " ").replace("-", " ").title()

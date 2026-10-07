@@ -113,10 +113,26 @@ def test_unknown_labelled_and_gated_by_zipf():
 
 def test_is_eligible_matrix():
     assert is_eligible("C2", 1.0, 5, 4.5) is True   # C2 > C1
-    assert is_eligible("C1", 1.0, 5, 4.5) is False  # equal excluded
+    assert is_eligible("C1", 1.0, 5, 4.5) is True   # equal level kept (inclusive)
+    assert is_eligible("B2", 1.0, 5, 4.5) is False  # below excluded
     assert is_eligible("A1", 1.0, 5, 4.5) is False
     assert is_eligible(None, 3.0, 5, 4.5) is True   # rare unknown kept
     assert is_eligible(None, 6.0, 5, 4.5) is False  # common unknown dropped
+
+
+def test_level_inclusive_keeps_equal_level():
+    counts = Counter({"mid": 2})
+    forms = {"mid": Counter({"mid": 2})}
+    contexts = {"mid": [("mid word here", "00:00:01")]}
+    cefr = {"mid": "B2"}
+    out = build_candidates(counts, forms, contexts, cefr,
+                           learner_level="B2", min_zipf=0, min_count=1)
+    assert [c["lemma"] for c in out] == ["mid"]  # B2 and above includes B2
+
+
+def test_top_zero_means_no_limit():
+    args = __import__("subtitle_vocab").parse_args(["x.srt", "--top", "0"])
+    assert args.top == 0
 
 
 def test_ranking_prefers_rare_and_recurrent():
