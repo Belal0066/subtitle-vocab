@@ -609,6 +609,25 @@ def build_candidates(lemma_counts: Counter,
     return out
 
 
+def suggest_excludes(ranked: list[dict], pos_counts: dict[str, Counter],
+                     n: int = 30) -> list[str]:
+    """Lemmas in the top-*n* that look like names or junk, for review.
+
+    Flags UNKNOWN words whose dominant POS is PROPN (names the NER
+    filter missed, e.g. ``roddy``) or whose Zipf is ~0 (typos, baby
+    talk, joke compounds like ``henchfrog``). Returns lemmas only --
+    the caller decides what to exclude.
+    """
+    out: list[str] = []
+    for cand in ranked[:n]:
+        if cand["cefr"] != CEFR_UNKNOWN:
+            continue
+        lemma = cand["lemma"]
+        if dominant_upos(pos_counts, lemma) == "PROPN" or cand["zipf"] <= 0.5:
+            out.append(lemma)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Export: CSV
 # ---------------------------------------------------------------------------
@@ -659,6 +678,20 @@ def deck_id_for(name: str) -> int:
     """Deterministic 31-bit deck id derived from the deck name."""
     digest = hashlib.md5(name.encode("utf-8")).hexdigest()
     return (int(digest[:8], 16) % (2 ** 31 - 1000)) + 1000
+
+
+def default_outdir(srt_path: Path) -> Path:
+    """Base folder for per-input output folders.
+
+    Normally ``<input-parent>/outputs``, but if the input already lives
+    under a folder named ``outputs`` (e.g. a movie folder that was
+    misplaced there), the nearest such ancestor is reused instead of
+    nesting ``outputs/outputs``.
+    """
+    for parent in srt_path.resolve().parents:
+        if parent.name == "outputs":
+            return parent
+    return srt_path.parent / "outputs"
 
 
 def slugify_stem(name: str, max_len: int = 80) -> str:
@@ -832,7 +865,7 @@ def resolve_defaults(args: argparse.Namespace) -> tuple[Path, Path]:
         sibling = (anchor.with_suffix(".csv") if explicit_output
                    else anchor.with_suffix(".apkg"))
         return (explicit_output or sibling), (args.csv or sibling)
-    outdir = args.outdir or args.srt_file.parent / "outputs"
+    outdir = args.outdir or default_outdir(args.srt_file)
     folder = outdir / slugify_stem(args.srt_file.name)
     return folder / "vocab.apkg", folder / "vocab.csv"
 

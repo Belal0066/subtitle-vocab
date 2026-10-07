@@ -2,7 +2,12 @@
 from pathlib import Path
 
 from define import define_default_paths
-from subtitle_vocab import parse_args, resolve_defaults, slugify_stem
+from subtitle_vocab import (
+    default_outdir,
+    parse_args,
+    resolve_defaults,
+    slugify_stem,
+)
 
 
 def test_slugify_strips_srt_and_spaces():
@@ -44,3 +49,14 @@ def test_define_default_paths():
     c, a, m = define_default_paths(Path("x/my.csv"))
     assert (c.name, a.name, m.name) == ("my_definitions.json",
                                         "my_defined.apkg", "my.md")
+
+
+def test_default_outdir_normal_case(tmp_path):
+    from subtitle_vocab import default_outdir
+    assert default_outdir(tmp_path / "movie.srt") == tmp_path / "outputs"
+
+
+def test_default_outdir_reuses_existing_outputs(tmp_path):
+    from subtitle_vocab import default_outdir
+    nested = tmp_path / "outputs" / "Some.Movie.srt" / "Some.Movie.srt"
+    assert default_outdir(nested) == tmp_path / "outputs"

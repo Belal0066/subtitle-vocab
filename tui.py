@@ -130,36 +130,86 @@ def load_nlp():
         raise SystemExit(1)
 
 
+def show_top_table(selected: list[dict], n: int = 10) -> None:
+    table = Table(title=f"Top {min(n, len(selected))} words")
+    for col in ("#", "lemma", "CEFR", "×", "zipf", "score"):
+        table.add_column(col, justify="right" if col != "lemma" else "left")
+    for i, c in enumerate(selected[:n], start=1):
+        table.add_row(str(i), c["lemma"], c["cefr"], str(c["count"]),
+                      f"{c['zipf']:.2f}", f"{c['score']:.2f}")
+    console.print(table)
+
+
+def review_excludes(ranked: list[dict], pos_counts: dict,
+                    excluded: set[str]) -> set[str]:
+    """Let the user drop names/junk, re-rank until they're happy."""
+    while True:
+        suggestions = [w for w in
+                       sv.suggest_excludes(ranked, pos_counts)
+                       if w not in excluded]
+        if suggestions:
+            console.print("[yellow]Likely names/junk:[/yellow] "
+                          + ", ".join(suggestions))
+            if Confirm.ask("Exclude all of them?", default=True):
+                excluded.update(suggestions)
+                return excluded
+        extra = Prompt.ask(
+            "Exclude more (comma-separated, ranks like 3 or 1,4, "
+            "empty when happy)", default="").strip()
+        if not extra:
+            return excluded
+        ranked_lemmas = [c["lemma"] for c in ranked]
+        for token in extra.split(","):
+            token = token.strip().lower()
+            if not token:
+                continue
+            if token.isdigit() and 1 <= int(token) <= len(ranked_lemmas):
+                excluded.add(ranked_lemmas[int(token) - 1])
+            else:
+                excluded.add(token)
+
+
 def run_ranking(srt: Path, cfg: dict) -> dict:
     import genanki
-    with console.status("[bold green]Ranking vocabulary…[/bold green]"):
+    with console.status("[bold green]Analysing subtitles…[/bold green]"):
         nlp = load_nlp()
         profile = sv.load_cefr_profiles(cfg["cefr"])
         subtitles = sv.parse_srt_file(srt)
         counts, forms, contexts, pos = sv.analyze_subtitles(subtitles, nlp)
-        ranked = sv.build_candidates(
+
+    def _build(excluded: set[str]) -> list[dict]:
+        return sv.build_candidates(
             counts, forms, contexts, profile, cfg["level"], cfg["min_zipf"],
-            cfg["min_count"], pos_counts=pos,
-            exclude=sv.parse_exclude(cfg["exclude"]))
+            cfg["min_count"], pos_counts=pos, exclude=excluded)
+
+    excluded = sv.parse_exclude(cfg["exclude"])
+    while True:
+        ranked = _build(excluded)
         selected = ranked[: cfg["top"]]
-        outdir = srt.parent / "outputs" / sv.slugify_stem(srt.name)
-        outdir.mkdir(parents=True, exist_ok=True)
-        csv_path, apkg_path = outdir / "vocab.csv", outdir / "vocab.apkg"
-        sv.write_csv(selected, csv_path)
-        deck_name = f"{srt.stem} Vocab"
-        genanki.Package(sv.build_deck(selected, contexts, deck_name)) \
-            .write_to_file(str(apkg_path))
-    console.print(Panel(
-        f"Subtitles {len(subtitles)} · lemmas {len(counts)} · "
-        f"candidates {len(ranked)} · selected {len(selected)}",
-        title="Ranking done"))
-    table = Table(title=f"Top {min(10, len(selected))} words")
-    for col in ("#", "lemma", "CEFR", "×", "zipf", "score"):
-        table.add_column(col, justify="right" if col != "lemma" else "left")
-    for i, c in enumerate(selected[:10], start=1):
-        table.add_row(str(i), c["lemma"], c["cefr"], str(c["count"]),
-                      f"{c['zipf']:.2f}", f"{c['score']:.2f}")
-    console.print(table)
+        console.print(Panel(
+            f"Subtitles {len(subtitles)} · lemmas {len(counts)} · "
+            f"candidates {len(ranked)} · selected {len(selected)}"
+            + (f" · excluded {len(excluded)}" if excluded else ""),
+            title="Ranking"))
+        if not selected:
+            console.print("[red]Nothing selected. Loosen excludes/filters.[/red]")
+        else:
+            show_top_table(selected)
+        before = set(excluded)
+        excluded = review_excludes(ranked, pos, excluded)
+        if set(excluded) == before:
+            break
+        ranked = _build(excluded)
+        selected = ranked[: cfg["top"]]
+        show_top_table(selected)
+
+    outdir = sv.default_outdir(srt) / sv.slugify_stem(srt.name)
+    outdir.mkdir(parents=True, exist_ok=True)
+    csv_path, apkg_path = outdir / "vocab.csv", outdir / "vocab.apkg"
+    sv.write_csv(selected, csv_path)
+    deck_name = f"{srt.stem} Vocab"
+    genanki.Package(sv.build_deck(selected, contexts, deck_name)) \
+        .write_to_file(str(apkg_path))
     return {"selected": selected, "contexts_full": contexts,
             "csv_path": csv_path, "outdir": outdir, "deck_name": deck_name}
 
@@ -170,15 +220,19 @@ def run_definitions(csv_path: Path, srt: Path, cfg: dict,
     model = Prompt.ask("Model", default=define_mod.DEFAULT_MODEL)
     api_key = os.environ.get(key_env)
     if not api_key:
-        console.print(f"[yellow]${key_env} is not set.[/yellow]")
+        console.print(f"[yellow]${key_env} is not set.[/yellow] "
+                      f"Tip: save it in a [bold].env[/bold] file "
+                      f"(GROQ_API_KEY=...) to skip this step.")
         pasted = Prompt.ask("Paste a Groq key (session-only, never stored, "
-                            "empty to skip definitions)",
+                            "empty for context-only cards)",
                             password=True, default="")
-        if not pasted.strip():
-            return 0, 0, outdir / "vocab.md"
-        api_key = pasted.strip()
-        os.environ[key_env] = api_key
+        api_key = pasted.strip() or None
+        if api_key:
+            os.environ[key_env] = api_key
     rows = define_mod.load_csv_rows(csv_path)
+    if not rows:
+        console.print("[red]CSV is empty.[/red]")
+        return 0, 0, outdir / "vocab.md"
     cache_path = outdir / "definitions.json"
     cache = define_mod.load_cache(cache_path)
     full_contexts = define_mod.analyse_srt_for_contexts(srt)

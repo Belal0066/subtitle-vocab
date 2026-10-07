@@ -281,3 +281,25 @@ def test_real_cefrj_files_load():
     assert prof.lookup("deceit", "NOUN") == "C1"
     assert prof.lookup("matchmaker", "NOUN") is None  # absent -> UNKNOWN path
     assert prof.lookup("mulan", "PROPN") is None
+
+
+# --- 10. exclude suggestions ----------------------------------------------------
+
+def test_suggest_excludes_names_and_junk():
+    from collections import Counter as _Counter
+    from subtitle_vocab import suggest_excludes
+
+    def _cand(lemma, cefr="UNKNOWN", zipf=1.0):
+        return {"lemma": lemma, "cefr": cefr, "zipf": zipf, "count": 1,
+                "score": 1.0}
+
+    ranked = [_cand("roddy"), _cand("bleahh", zipf=0.0),
+              _cand("dishonor", zipf=2.9), _cand("sword", cefr="B1")]
+    pos = {"roddy": _Counter({"PROPN": 5}),
+           "bleahh": _Counter({"INTJ": 1}),
+           "dishonor": _Counter({"NOUN": 4})}
+    out = suggest_excludes(ranked, pos)
+    assert "roddy" in out      # PROPN-dominant name
+    assert "bleahh" in out     # zipf ~0 junk
+    assert "dishonor" not in out  # real rare word kept
+    assert "sword" not in out     # known CEFR never suggested
